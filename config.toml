@@ -1,0 +1,4 @@
+server.headless = true
+server.enableCORS = true
+server.enableXsrfProtection = true
+
