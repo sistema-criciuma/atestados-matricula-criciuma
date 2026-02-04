@@ -197,7 +197,7 @@ def generate_lista_turmas_pdf(
             rows.append([id_aluno, inep, nome_cell, ""])
 
         # Larguras (A4 útil ~170mm com margens 20mm/20mm)
-        col_widths = [15 * mm, 28 * mm, 50 * mm, 100 * mm]
+        col_widths = [12 * mm, 25 * mm, 60 * mm, 75 * mm]
 
         table = Table(rows, colWidths=col_widths, repeatRows=1)
         table.setStyle(
@@ -233,5 +233,6 @@ def generate_lista_turmas_pdf(
 
 # ReportLab precisa disso se você usar PageBreak como flowable
 from reportlab.platypus import PageBreak  # noqa: E402
+
 
 
