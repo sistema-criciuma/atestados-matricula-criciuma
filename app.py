@@ -1,47 +1,36 @@
+import base64
+import gzip
 import json
+import re
+import unicodedata
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-import base64
-import gzip
-from io import BytesIO
-
-import re
-import unicodedata
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Tuple
-
 import pandas as pd
 import streamlit as st
 
-from pdf_atestado import AtestadoData, generate_atestado_pdf, normalize_intlike, excel_serial_to_iso
+from pdf_atestado import AtestadoData, excel_serial_to_iso, generate_atestado_pdf, normalize_intlike
+from pdf_lista_turmas import generate_lista_turmas_pdf
 
-
+# -----------------------------
+# Constantes / paths
+# -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-USUARIOS_CSV = BASE_DIR / "usuarios.csv"
-MATRICULAS_CSV = BASE_DIR / "matriculas_p_atestado.csv"
+USUARIOS_CSV = BASE_DIR / "usuarios.csv"  # fallback local
+MATRICULAS_CSV = BASE_DIR / "matriculas_p_atestado.csv"  # fallback local
 LOGO_PATH = BASE_DIR / "logo.png"  # opcional (se existir)
+
 TZ = ZoneInfo("America/Sao_Paulo")
 
 
-def read_csv_from_secret_gz_b64(secret_key: str, *, encoding: str, **read_csv_kwargs) -> pd.DataFrame:
-    if secret_key not in st.secrets:
-        raise KeyError(f"Secret não encontrado: {secret_key}")
-
-    raw = str(st.secrets[secret_key])
-    raw = re.sub(r"\s+", "", raw)
-
-    data = gzip.decompress(base64.b64decode(raw))
-
-    return pd.read_csv(BytesIO(data), encoding=encoding, **read_csv_kwargs)
-
-
-def is_admin_user(usuario: str) -> bool:
-    return (usuario or "").strip().upper() == "SME"
-
-
+# -----------------------------
+# Utilidades gerais
+# -----------------------------
 def safe_filename_name(nome: str) -> str:
     s = (nome or "").strip()
     s = unicodedata.normalize("NFKD", s)
@@ -53,9 +42,28 @@ def safe_filename_name(nome: str) -> str:
     return s or "aluno"
 
 
+def is_admin_user(usuario: str) -> bool:
+    return (usuario or "").strip().upper() == "SME"
+
+
+def read_csv_from_secret_gz_b64(secret_key: str, *, encoding: str, **read_csv_kwargs) -> pd.DataFrame:
+    if secret_key not in st.secrets:
+        raise KeyError(f"Secret não encontrado: {secret_key}")
+
+    raw = str(st.secrets[secret_key])
+    raw = re.sub(r"\s+", "", raw)
+
+    data = gzip.decompress(base64.b64decode(raw))
+    return pd.read_csv(BytesIO(data), encoding=encoding, **read_csv_kwargs)
+
+
+# -----------------------------
+# Usuários (sempre secret; fallback local opcional)
+# -----------------------------
 @st.cache_data(show_spinner=False)
 def load_usuarios() -> pd.DataFrame:
     if "USUARIOS_CSV_GZ_B64" in st.secrets:
+        # seu padrão original (latin-1). Se mudar para utf-8, troque aqui.
         df = read_csv_from_secret_gz_b64(
             "USUARIOS_CSV_GZ_B64",
             encoding="latin-1",
@@ -74,8 +82,8 @@ def load_usuarios() -> pd.DataFrame:
             )
 
     df["Escola"] = df["Escola"].astype(str).str.strip()
-    df["Usuario"] = df["Usuario"].astype(str)
-    df["Senha"] = df["Senha"].astype(str)
+    df["Usuario"] = df["Usuario"].astype(str).str.strip()
+    df["Senha"] = df["Senha"].astype(str).str.strip()
     return df
 
 
@@ -102,11 +110,14 @@ def auth_user(usuario: str, senha_digitada: str) -> Tuple[bool, dict]:
 
     return True, {
         "usuario": u_in,
-        "escola": str(row.get("Escola", "")).strip(),
+        "escola": str(row.get("Escola", "")).strip(),  # para não-admin
         "is_admin": admin,
     }
 
 
+# -----------------------------
+# Matrículas: API (cloud) ou CSV (fallback local)
+# -----------------------------
 def using_matriculas_api() -> bool:
     return "MATRICULAS_API_URL" in st.secrets and "MATRICULAS_API_TOKEN" in st.secrets
 
@@ -134,8 +145,7 @@ def api_get(op: str, params: dict | None = None) -> dict:
 
 @st.cache_data(show_spinner=False, ttl=300)
 def api_list_schools() -> list[str]:
-    data = api_get("schools")
-    return data.get("schools", [])
+    return api_get("schools").get("schools", [])
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -174,17 +184,42 @@ def api_student(escola: str, ano: str, id_norm: str) -> pd.DataFrame:
     return prepare_matriculas_df(df)
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def api_export(escola: str, ano: str, situacao: str) -> pd.DataFrame:
+    data = api_get(
+        "export",
+        {
+            "escola": (escola or "").strip().upper(),
+            "ano": str(ano or "").strip(),
+            "situacao": str(situacao or "").strip(),
+            "limit": 20000,
+        },
+    )
+    df = pd.DataFrame(data.get("rows", []))
+    return prepare_matriculas_df(df)
+
+
 def prepare_matriculas_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
     required = [
-        "ID Aluno", "Código INEP (Aluno)", "Nome", "Escola", "Turma", "Série",
-        "Curso", "Data da Matrícula", "Ano", "Situação da Matrícula", "Turno", "Nome da mãe"
+        "ID Aluno",
+        "Código INEP (Aluno)",
+        "Nome",
+        "Escola",
+        "Turma",
+        "Série",
+        "Curso",
+        "Data da Matrícula",
+        "Ano",
+        "Situação da Matrícula",
+        "Turno",
+        "Nome da mãe",
     ]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"API retornou dados sem colunas obrigatórias: {missing}")
+        raise ValueError(f"Dados retornados sem colunas obrigatórias: {missing}")
 
     df["Escola_norm"] = df["Escola"].astype(str).str.strip().str.upper()
     df["Nome_norm"] = df["Nome"].astype(str).str.strip().str.upper()
@@ -194,17 +229,24 @@ def prepare_matriculas_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_matriculas() -> pd.DataFrame:
-    if "MATRICULAS_CSV_GZ_B64" in st.secrets:
-        df = read_csv_from_secret_gz_b64("MATRICULAS_CSV_GZ_B64", encoding="utf-8-sig")
-    else:
-        if not MATRICULAS_CSV.exists():
-            raise FileNotFoundError(f"Arquivo não encontrado: {MATRICULAS_CSV}")
-        df = pd.read_csv(MATRICULAS_CSV, encoding="utf-8-sig")
+def load_matriculas_local() -> pd.DataFrame:
+    if not MATRICULAS_CSV.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {MATRICULAS_CSV}")
+    df = pd.read_csv(MATRICULAS_CSV, encoding="utf-8-sig")
 
     required = [
-        "ID Aluno", "Código INEP (Aluno)", "Nome", "Escola", "Turma", "Série",
-        "Curso", "Data da Matrícula", "Ano", "Situação da Matrícula", "Turno", "Nome da mãe"
+        "ID Aluno",
+        "Código INEP (Aluno)",
+        "Nome",
+        "Escola",
+        "Turma",
+        "Série",
+        "Curso",
+        "Data da Matrícula",
+        "Ano",
+        "Situação da Matrícula",
+        "Turno",
+        "Nome da mãe",
     ]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -217,6 +259,9 @@ def load_matriculas() -> pd.DataFrame:
     return df
 
 
+# -----------------------------
+# Regras para o atestado
+# -----------------------------
 def safe_first(series: pd.Series) -> str:
     for v in series.tolist():
         if pd.notna(v) and str(v).strip():
@@ -269,6 +314,9 @@ def logout():
             del st.session_state[k]
 
 
+# -----------------------------
+# UI principal
+# -----------------------------
 def main():
     st.set_page_config(page_title="Atestado de Matrícula", layout="centered")
     st.title("Atestado de Matrícula")
@@ -297,152 +345,258 @@ def main():
 
     usuario = st.session_state.get("usuario", "").strip()
     is_admin = bool(st.session_state.get("is_admin", False))
+    use_api = using_matriculas_api()
 
     st.write(f"Usuário: {usuario}")
     if is_admin:
         st.write("Perfil: admin (SME)")
-
     st.button("Sair", on_click=logout)
 
-    use_api = using_matriculas_api()
+    tab_atestado, tab_listas = st.tabs(["Atestado", "Listas por turma"])
 
-    if use_api:
-        if is_admin:
-            escolas = api_list_schools()
-            escola_sel = st.selectbox("Escola", options=escolas)
-            escola = (escola_sel or "").strip()
+    # ==========================
+    # Aba 1: Atestado
+    # ==========================
+    with tab_atestado:
+        # seleção de escola/ano/situação
+        if use_api:
+            if is_admin:
+                escolas = api_list_schools()
+                escola_sel = st.selectbox("Escola", options=escolas, key="at_escola")
+                escola = (escola_sel or "").strip()
+            else:
+                escola = st.session_state.get("escola", "").strip()
+                st.write(f"Escola: {escola}")
+
+            if not escola:
+                st.warning("Nenhuma escola disponível.")
+                st.stop()
+
+            anos = api_list_years(escola)
+            if not anos:
+                st.warning("Não há anos disponíveis para esta escola.")
+                st.stop()
+
+            ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1, key="at_ano")
+
+            sit_sel = st.text_input("Situação da matrícula (opcional)", value="Cursando", key="at_sit").strip()
+            if sit_sel.lower() in ("", "(todas)", "todas"):
+                sit_sel = ""
+
+            st.subheader("Buscar aluno")
+            q = st.text_input("Digite nome, ID do aluno ou INEP", value="", key="at_q").strip().upper()
+
+            df_busca = api_search(escola, ano_sel, sit_sel, q, limit=200)
+
         else:
-            escola = st.session_state.get("escola", "").strip()
-            st.write(f"Escola: {escola}")
+            dfm = load_matriculas_local()
 
-        if not escola:
-            st.warning("Nenhuma escola disponível.")
+            if is_admin:
+                escolas = sorted(dfm["Escola"].dropna().astype(str).str.strip().unique().tolist())
+                escola_sel = st.selectbox("Escola", options=escolas, key="at_escola_local")
+                escola = (escola_sel or "").strip()
+            else:
+                escola = st.session_state.get("escola", "").strip()
+                st.write(f"Escola: {escola}")
+
+            dfm_escola = dfm.loc[dfm["Escola_norm"] == escola.strip().upper()].copy()
+            if dfm_escola.empty:
+                st.warning("Não há matrículas para esta escola na tabela.")
+                st.stop()
+
+            anos = sorted([str(a) for a in dfm_escola["Ano"].dropna().unique()])
+            ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1, key="at_ano_local")
+
+            df_ano = dfm_escola.loc[dfm_escola["Ano"].astype(str) == str(ano_sel)].copy()
+
+            if "Situação da Matrícula" in df_ano.columns:
+                situacoes = ["(todas)"] + sorted([str(x) for x in df_ano["Situação da Matrícula"].dropna().unique()])
+                sit_sel = st.selectbox(
+                    "Situação da matrícula",
+                    options=situacoes,
+                    index=1 if "Cursando" in situacoes else 0,
+                    key="at_sit_local",
+                )
+                if sit_sel != "(todas)":
+                    df_ano = df_ano.loc[df_ano["Situação da Matrícula"].astype(str) == sit_sel]
+
+            st.subheader("Buscar aluno")
+            q = st.text_input("Digite nome, ID do aluno ou INEP", value="", key="at_q_local").strip().upper()
+
+            df_busca = df_ano
+            if q:
+                digits = "".join([c for c in q if c.isdigit()])
+                mask_nome = df_ano["Nome_norm"].str.contains(q, na=False)
+                mask_id = df_ano["ID_norm"].eq(digits) if digits else False
+                mask_inep = df_ano["INEP_norm"].eq(digits) if digits else False
+                df_busca = df_ano.loc[mask_nome | mask_id | mask_inep]
+
+        if df_busca is None or df_busca.empty:
+            st.info("Nenhum aluno encontrado com esse filtro.")
             st.stop()
 
-        anos = api_list_years(escola)
-        if not anos:
-            st.warning("Não há anos disponíveis para esta escola.")
-            st.stop()
+        cols_show = ["Nome", "ID_norm", "INEP_norm", "Turma", "Turno", "Série", "Curso"]
+        df_lista = (
+            df_busca[cols_show]
+            .drop_duplicates(subset=["ID_norm"])
+            .sort_values(["Nome"])
+            .reset_index(drop=True)
+        )
 
-        ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1)
+        st.dataframe(df_lista.head(200), use_container_width=True, hide_index=True)
 
-        sit_sel = st.text_input("Situação da matrícula (opcional)", value="Cursando").strip()
-        if sit_sel.lower() in ("", "(todas)", "todas"):
-            sit_sel = ""
+        options = df_lista.apply(
+            lambda r: f"{r['Nome']} | ID {r['ID_norm']} | INEP {r['INEP_norm']} | {r['Turma']} | {r['Turno']}",
+            axis=1,
+        ).tolist()
 
-        st.subheader("Buscar aluno")
-        q = st.text_input("Digite nome, ID do aluno ou INEP", value="").strip().upper()
+        idx = st.selectbox("Selecionar aluno", options=list(range(len(options))), format_func=lambda i: options[i], key="at_idx")
+        sel_id = df_lista.loc[idx, "ID_norm"]
 
-        df_busca = api_search(escola, ano_sel, sit_sel, q, limit=200)
-
-    else:
-        dfm = load_matriculas()
-
-        if is_admin:
-            escolas = sorted(dfm["Escola"].dropna().astype(str).str.strip().unique().tolist())
-            escola_sel = st.selectbox("Escola", options=escolas)
-            escola = (escola_sel or "").strip()
-            dfm_escola = dfm.loc[dfm["Escola_norm"] == escola.upper()].copy()
+        if use_api:
+            df_aluno = api_student(escola, ano_sel, sel_id)
         else:
-            escola = st.session_state.get("escola", "").strip()
-            st.write(f"Escola: {escola}")
-            dfm_escola = dfm.loc[dfm["Escola_norm"] == escola.upper()].copy()
+            df_aluno = df_busca.loc[df_busca["ID_norm"] == sel_id].copy()
 
-        if dfm_escola.empty:
-            st.warning("Não há matrículas para esta escola na tabela.")
+        if df_aluno is None or df_aluno.empty:
+            st.warning("Não foi possível carregar os dados completos do aluno.")
             st.stop()
 
-        anos = sorted([str(a) for a in dfm_escola["Ano"].dropna().unique()])
-        ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1)
+        st.subheader("Dados para o atestado")
+        st.write(f"Aluno: {safe_first(df_aluno['Nome'])}")
+        st.write(f"Mãe: {safe_first(df_aluno['Nome da mãe'])}")
+        st.write(f"Turma(s): {agg_unique(df_aluno['Turma'])}")
+        st.write(f"Série(s): {agg_unique(df_aluno['Série'])}")
+        st.write(f"Curso(s): {agg_unique(df_aluno['Curso'])}")
+        st.write(f"Turno(s): {agg_unique(df_aluno['Turno'])}")
 
-        df_ano = dfm_escola.loc[dfm_escola["Ano"].astype(str) == str(ano_sel)].copy()
+        if st.button("Gerar PDF", key="at_btn_pdf"):
+            at = build_atestado_data(df_aluno, ano_sel, escola)
+            emitted_dt = datetime.now(TZ)
 
-        if "Situação da Matrícula" in df_ano.columns:
-            situacoes = ["(todas)"] + sorted([str(x) for x in df_ano["Situação da Matrícula"].dropna().unique()])
-            sit_sel = st.selectbox(
-                "Situação da matrícula",
-                options=situacoes,
-                index=1 if "Cursando" in situacoes else 0,
+            logo_path = str(LOGO_PATH) if LOGO_PATH.exists() else None
+            pdf_bytes = generate_atestado_pdf(
+                data=at,
+                emitted_dt=emitted_dt,
+                city_uf="Criciúma / SC",
+                logo_path=logo_path,
+                school_meta=None,
             )
+
+            aluno_nome = safe_filename_name(at.nome)
+            data_emissao = emitted_dt.strftime("%Y-%m-%d")
+            filename = f"matricula_{aluno_nome}_{data_emissao}.pdf"
+
+            st.success("PDF gerado.")
+            st.download_button(
+                label="Baixar PDF",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+            )
+
+    # ==========================
+    # Aba 2: Listas por turma
+    # ==========================
+    with tab_listas:
+        st.subheader("Listas de alunos por turma")
+
+        if use_api:
+            # seleção
+            if is_admin:
+                escolas = api_list_schools()
+                escola_sel = st.selectbox("Escola", options=escolas, key="lt_escola")
+                escola = (escola_sel or "").strip()
+            else:
+                escola = st.session_state.get("escola", "").strip()
+                st.write(f"Escola: {escola}")
+
+            if not escola:
+                st.warning("Nenhuma escola disponível.")
+                st.stop()
+
+            anos = api_list_years(escola)
+            if not anos:
+                st.warning("Não há anos disponíveis para esta escola.")
+                st.stop()
+
+            ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1, key="lt_ano")
+
+            sit_sel = st.text_input("Situação da matrícula (opcional)", value="Cursando", key="lt_sit").strip()
+            if sit_sel.lower() in ("", "(todas)", "todas"):
+                sit_sel = ""
+
+            if st.button("Gerar PDF com todas as turmas", key="lt_btn"):
+                with st.spinner("Carregando dados e montando PDF..."):
+                    df_all = api_export(escola, ano_sel, sit_sel)
+
+                    if df_all is None or df_all.empty:
+                        st.info("Sem registros para os filtros escolhidos.")
+                        st.stop()
+
+                    emitted_dt = datetime.now(TZ)
+                    pdf_bytes = generate_lista_turmas_pdf(df_all, escola=escola, emitted_dt=emitted_dt)
+
+                    nome_escola = safe_filename_name(escola)
+                    data_emissao = emitted_dt.strftime("%Y-%m-%d")
+                    filename = f"lista_turmas_{nome_escola}_{data_emissao}.pdf"
+
+                st.success("PDF gerado.")
+                st.download_button(
+                    "Baixar PDF",
+                    data=pdf_bytes,
+                    file_name=filename,
+                    mime="application/pdf",
+                )
+
+        else:
+            st.info("Modo local (CSV): gerando a lista a partir do arquivo matriculas_p_atestado.csv.")
+            dfm = load_matriculas_local()
+
+            if is_admin:
+                escolas = sorted(dfm["Escola"].dropna().astype(str).str.strip().unique().tolist())
+                escola_sel = st.selectbox("Escola", options=escolas, key="lt_escola_local")
+                escola = (escola_sel or "").strip()
+            else:
+                escola = st.session_state.get("escola", "").strip()
+                st.write(f"Escola: {escola}")
+
+            dfm_escola = dfm.loc[dfm["Escola_norm"] == escola.strip().upper()].copy()
+            if dfm_escola.empty:
+                st.warning("Não há matrículas para esta escola na tabela.")
+                st.stop()
+
+            anos = sorted([str(a) for a in dfm_escola["Ano"].dropna().unique()])
+            ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1, key="lt_ano_local")
+
+            df_ano = dfm_escola.loc[dfm_escola["Ano"].astype(str) == str(ano_sel)].copy()
+
+            situacoes = ["(todas)"] + sorted([str(x) for x in df_ano["Situação da Matrícula"].dropna().unique()])
+            sit_sel = st.selectbox("Situação da matrícula", options=situacoes, key="lt_sit_local")
             if sit_sel != "(todas)":
                 df_ano = df_ano.loc[df_ano["Situação da Matrícula"].astype(str) == sit_sel]
 
-        st.subheader("Buscar aluno")
-        q = st.text_input("Digite nome, ID do aluno ou INEP", value="").strip().upper()
+            if st.button("Gerar PDF com todas as turmas", key="lt_btn_local"):
+                with st.spinner("Montando PDF..."):
+                    if df_ano is None or df_ano.empty:
+                        st.info("Sem registros para os filtros escolhidos.")
+                        st.stop()
 
-        df_busca = df_ano
-        if q:
-            digits = "".join([c for c in q if c.isdigit()])
-            mask_nome = df_ano["Nome_norm"].str.contains(q, na=False)
-            mask_id = df_ano["ID_norm"].eq(digits) if digits else False
-            mask_inep = df_ano["INEP_norm"].eq(digits) if digits else False
-            df_busca = df_ano.loc[mask_nome | mask_id | mask_inep]
+                    emitted_dt = datetime.now(TZ)
+                    pdf_bytes = generate_lista_turmas_pdf(df_ano, escola=escola, emitted_dt=emitted_dt)
 
-    if df_busca is None or df_busca.empty:
-        st.info("Nenhum aluno encontrado com esse filtro.")
-        st.stop()
+                    nome_escola = safe_filename_name(escola)
+                    data_emissao = emitted_dt.strftime("%Y-%m-%d")
+                    filename = f"lista_turmas_{nome_escola}_{data_emissao}.pdf"
 
-    cols_show = ["Nome", "ID_norm", "INEP_norm", "Turma", "Turno", "Série", "Curso"]
-    df_lista = (
-        df_busca[cols_show]
-        .drop_duplicates(subset=["ID_norm"])
-        .sort_values(["Nome"])
-        .reset_index(drop=True)
-    )
-
-    st.dataframe(df_lista.head(200), use_container_width=True, hide_index=True)
-
-    options = df_lista.apply(
-        lambda r: f"{r['Nome']} | ID {r['ID_norm']} | INEP {r['INEP_norm']} | {r['Turma']} | {r['Turno']}",
-        axis=1,
-    ).tolist()
-
-    idx = st.selectbox("Selecionar aluno", options=list(range(len(options))), format_func=lambda i: options[i])
-    sel_id = df_lista.loc[idx, "ID_norm"]
-
-    if use_api:
-        df_aluno = api_student(escola, ano_sel, sel_id)
-    else:
-        df_aluno = df_busca.loc[df_busca["ID_norm"] == sel_id].copy()
-
-    if df_aluno is None or df_aluno.empty:
-        st.warning("Não foi possível carregar os dados completos do aluno.")
-        st.stop()
-
-    st.subheader("Dados para o atestado")
-    st.write(f"Aluno: {safe_first(df_aluno['Nome'])}")
-    st.write(f"Mãe: {safe_first(df_aluno['Nome da mãe'])}")
-    st.write(f"Turma(s): {agg_unique(df_aluno['Turma'])}")
-    st.write(f"Série(s): {agg_unique(df_aluno['Série'])}")
-    st.write(f"Curso(s): {agg_unique(df_aluno['Curso'])}")
-    st.write(f"Turno(s): {agg_unique(df_aluno['Turno'])}")
-
-    if st.button("Gerar PDF"):
-        at = build_atestado_data(df_aluno, ano_sel, escola)
-        emitted_dt = datetime.now(TZ)
-
-        logo_path = str(LOGO_PATH) if LOGO_PATH.exists() else None
-        pdf_bytes = generate_atestado_pdf(
-            data=at,
-            emitted_dt=emitted_dt,
-            city_uf="Criciúma / SC",
-            logo_path=logo_path,
-            school_meta=None,
-        )
-
-        aluno_nome = safe_filename_name(at.nome)
-        data_emissao = emitted_dt.strftime("%d-%m-%Y")
-        filename = f"matricula_{aluno_nome}_{data_emissao}.pdf"
-
-        st.success("PDF gerado.")
-        st.download_button(
-            label="Baixar PDF",
-            data=pdf_bytes,
-            file_name=filename,
-            mime="application/pdf",
-        )
+                st.success("PDF gerado.")
+                st.download_button(
+                    "Baixar PDF",
+                    data=pdf_bytes,
+                    file_name=filename,
+                    mime="application/pdf",
+                )
 
 
 if __name__ == "__main__":
     main()
-
