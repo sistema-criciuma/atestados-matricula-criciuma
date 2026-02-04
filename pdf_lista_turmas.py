@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_LOGO_PATH = BASE_DIR / "logo.png"
+
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -57,7 +62,9 @@ def generate_lista_turmas_pdf(
     Inclui totalizador por turma.
     Inclui logo em todas as páginas (se existir).
     """
-
+    if not logo_path and DEFAULT_LOGO_PATH.exists():
+        logo_path = str(DEFAULT_LOGO_PATH)
+        
     if df is None or df.empty:
         return b""
 
@@ -197,7 +204,7 @@ def generate_lista_turmas_pdf(
             rows.append([id_aluno, inep, nome_cell, ""])
 
         # Larguras (A4 útil ~170mm com margens 20mm/20mm)
-        col_widths = [12 * mm, 25 * mm, 60 * mm, 75 * mm]
+        col_widths = [12 * mm, 27 * mm, 60 * mm, 75 * mm]
 
         table = Table(rows, colWidths=col_widths, repeatRows=1)
         table.setStyle(
@@ -233,6 +240,7 @@ def generate_lista_turmas_pdf(
 
 # ReportLab precisa disso se você usar PageBreak como flowable
 from reportlab.platypus import PageBreak  # noqa: E402
+
 
 
 
