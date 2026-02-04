@@ -169,8 +169,8 @@ def generate_lista_turmas_pdf(
         if logo_path and os.path.exists(logo_path):
             try:
                 img = Image(logo_path)
-                img.drawHeight = 18 * mm
-                img.drawWidth = 18 * mm
+                img.drawHeight = 19.2 * 1.5 * mm
+                img.drawWidth = 10.8 * 1.5 * mm
                 story.append(img)
                 story.append(Spacer(1, 2 * mm))
             except Exception:
@@ -240,6 +240,7 @@ def generate_lista_turmas_pdf(
 
 # ReportLab precisa disso se você usar PageBreak como flowable
 from reportlab.platypus import PageBreak  # noqa: E402
+
 
 
 
