@@ -83,7 +83,7 @@ def generate_lista_turmas_pdf(
         story.append(Paragraph("<br/>".join(header_lines), s_norm))
         story.append(Spacer(1, 6 * mm))
 
-        data = [["ID", "INEP", "Aluno", "Gênero", "Data de nascimento"]]
+        data = [["ID", "INEP", "Aluno", "Gênero", "Nascimento"]]
         g_sorted = g.sort_values(["Aluno_show", "ID_show"], ascending=True)
 
         for _, r in g_sorted.iterrows():
@@ -117,3 +117,4 @@ def generate_lista_turmas_pdf(
 
     doc.build(story)
     return buf.getvalue()
+
