@@ -1,6 +1,7 @@
 import json
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import base64
 import gzip
@@ -22,6 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent
 USUARIOS_CSV = BASE_DIR / "usuarios.csv"
 MATRICULAS_CSV = BASE_DIR / "matriculas_p_atestado.csv"
 LOGO_PATH = BASE_DIR / "logo.png"  # opcional (se existir)
+TZ = ZoneInfo("America/Sao_Paulo")
 
 
 def read_csv_from_secret_gz_b64(secret_key: str, *, encoding: str, **read_csv_kwargs) -> pd.DataFrame:
@@ -417,7 +419,7 @@ def main():
 
     if st.button("Gerar PDF"):
         at = build_atestado_data(df_aluno, ano_sel, escola)
-        emitted_dt = datetime.now()
+        emitted_dt = datetime.now(TZ)
 
         logo_path = str(LOGO_PATH) if LOGO_PATH.exists() else None
         pdf_bytes = generate_atestado_pdf(
@@ -429,7 +431,7 @@ def main():
         )
 
         aluno_nome = safe_filename_name(at.nome)
-        data_emissao = emitted_dt.strftime("%Y-%m-%d")
+        data_emissao = emitted_dt.strftime("%d-%m-%Y")
         filename = f"matricula_{aluno_nome}_{data_emissao}.pdf"
 
         st.success("PDF gerado.")
@@ -443,3 +445,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
