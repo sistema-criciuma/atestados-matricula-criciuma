@@ -1,3 +1,7 @@
+import json
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
 import base64
 import gzip
 from io import BytesIO
@@ -19,23 +23,18 @@ USUARIOS_CSV = BASE_DIR / "usuarios.csv"
 MATRICULAS_CSV = BASE_DIR / "matriculas_p_atestado.csv"
 LOGO_PATH = BASE_DIR / "logo.png"  # opcional (se existir)
 
+
 def read_csv_from_secret_gz_b64(secret_key: str, *, encoding: str, **read_csv_kwargs) -> pd.DataFrame:
     if secret_key not in st.secrets:
         raise KeyError(f"Secret não encontrado: {secret_key}")
 
     raw = str(st.secrets[secret_key])
-
-    # remove quebras de linha / espaços que possam ter sido inseridos no TOML
     raw = re.sub(r"\s+", "", raw)
 
-    data = base64.b64decode(raw)
-    data = gzip.decompress(data)
+    data = gzip.decompress(base64.b64decode(raw))
 
-    return pd.read_csv(
-        BytesIO(data),
-        encoding=encoding,
-        **read_csv_kwargs,
-    )
+    return pd.read_csv(BytesIO(data), encoding=encoding, **read_csv_kwargs)
+
 
 def is_admin_user(usuario: str) -> bool:
     return (usuario or "").strip().upper() == "SME"
@@ -46,15 +45,14 @@ def safe_filename_name(nome: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))  # remove acentos
     s = s.replace("/", "-").replace("\\", "-")
-    s = re.sub(r"\s+", "_", s)               # espaços -> _
-    s = re.sub(r"[^A-Za-z0-9_\-]", "", s)    # remove caracteres estranhos
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_\-]", "", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "aluno"
 
 
 @st.cache_data(show_spinner=False)
 def load_usuarios() -> pd.DataFrame:
-    # prioridade: secrets (deploy)
     if "USUARIOS_CSV_GZ_B64" in st.secrets:
         df = read_csv_from_secret_gz_b64(
             "USUARIOS_CSV_GZ_B64",
@@ -63,7 +61,6 @@ def load_usuarios() -> pd.DataFrame:
             keep_default_na=False,
         )
     else:
-        # fallback local (opcional)
         if not USUARIOS_CSV.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {USUARIOS_CSV}")
         df = pd.read_csv(USUARIOS_CSV, encoding="latin-1", dtype=str, keep_default_na=False)
@@ -103,21 +100,102 @@ def auth_user(usuario: str, senha_digitada: str) -> Tuple[bool, dict]:
 
     return True, {
         "usuario": u_in,
-        "escola": str(row.get("Escola", "")).strip(),  # mantém, mas admin não fica preso a ela
+        "escola": str(row.get("Escola", "")).strip(),
         "is_admin": admin,
     }
 
 
+def using_matriculas_api() -> bool:
+    return "MATRICULAS_API_URL" in st.secrets and "MATRICULAS_API_TOKEN" in st.secrets
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def api_get(op: str, params: dict | None = None) -> dict:
+    url = str(st.secrets["MATRICULAS_API_URL"]).strip()
+    token = str(st.secrets["MATRICULAS_API_TOKEN"]).strip()
+
+    q = {"op": op, "token": token}
+    if params:
+        q.update(params)
+
+    full_url = f"{url}?{urlencode(q)}"
+    req = Request(full_url, headers={"User-Agent": "streamlit"})
+
+    with urlopen(req, timeout=30) as resp:
+        body = resp.read().decode("utf-8")
+
+    data = json.loads(body)
+    if not data.get("ok", False):
+        raise RuntimeError(f"API retornou erro: {data}")
+    return data
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def api_list_schools() -> list[str]:
+    data = api_get("schools")
+    return data.get("schools", [])
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def api_list_years(escola: str) -> list[str]:
+    data = api_get("years", {"escola": (escola or "").strip().upper()})
+    return data.get("years", [])
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def api_search(escola: str, ano: str, situacao: str, q: str, limit: int = 200) -> pd.DataFrame:
+    data = api_get(
+        "search",
+        {
+            "escola": (escola or "").strip().upper(),
+            "ano": str(ano or "").strip(),
+            "situacao": str(situacao or "").strip(),
+            "q": str(q or "").strip(),
+            "limit": int(limit),
+        },
+    )
+    df = pd.DataFrame(data.get("rows", []))
+    return prepare_matriculas_df(df)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def api_student(escola: str, ano: str, id_norm: str) -> pd.DataFrame:
+    data = api_get(
+        "student",
+        {
+            "escola": (escola or "").strip().upper(),
+            "ano": str(ano or "").strip(),
+            "id_norm": str(id_norm or "").strip(),
+        },
+    )
+    df = pd.DataFrame(data.get("rows", []))
+    return prepare_matriculas_df(df)
+
+
+def prepare_matriculas_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    required = [
+        "ID Aluno", "Código INEP (Aluno)", "Nome", "Escola", "Turma", "Série",
+        "Curso", "Data da Matrícula", "Ano", "Situação da Matrícula", "Turno", "Nome da mãe"
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"API retornou dados sem colunas obrigatórias: {missing}")
+
+    df["Escola_norm"] = df["Escola"].astype(str).str.strip().str.upper()
+    df["Nome_norm"] = df["Nome"].astype(str).str.strip().str.upper()
+    df["ID_norm"] = df["ID Aluno"].apply(normalize_intlike)
+    df["INEP_norm"] = df["Código INEP (Aluno)"].apply(normalize_intlike)
+    return df
+
+
 @st.cache_data(show_spinner=False)
 def load_matriculas() -> pd.DataFrame:
-    # prioridade: secrets (deploy)
     if "MATRICULAS_CSV_GZ_B64" in st.secrets:
-        df = read_csv_from_secret_gz_b64(
-            "MATRICULAS_CSV_GZ_B64",
-            encoding="utf-8-sig",
-        )
+        df = read_csv_from_secret_gz_b64("MATRICULAS_CSV_GZ_B64", encoding="utf-8-sig")
     else:
-        # fallback local (opcional)
         if not MATRICULAS_CSV.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {MATRICULAS_CSV}")
         df = pd.read_csv(MATRICULAS_CSV, encoding="utf-8-sig")
@@ -224,51 +302,81 @@ def main():
 
     st.button("Sair", on_click=logout)
 
-    dfm = load_matriculas()
+    use_api = using_matriculas_api()
 
-    if is_admin:
-        escolas = sorted(
-            dfm["Escola"].dropna().astype(str).str.strip().unique().tolist()
-        )
-        escola_sel = st.selectbox("Escola", options=escolas)
-        escola = (escola_sel or "").strip()
-        dfm_escola = dfm.loc[dfm["Escola_norm"] == escola.upper()].copy()
+    if use_api:
+        if is_admin:
+            escolas = api_list_schools()
+            escola_sel = st.selectbox("Escola", options=escolas)
+            escola = (escola_sel or "").strip()
+        else:
+            escola = st.session_state.get("escola", "").strip()
+            st.write(f"Escola: {escola}")
+
+        if not escola:
+            st.warning("Nenhuma escola disponível.")
+            st.stop()
+
+        anos = api_list_years(escola)
+        if not anos:
+            st.warning("Não há anos disponíveis para esta escola.")
+            st.stop()
+
+        ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1)
+
+        sit_sel = st.text_input("Situação da matrícula (opcional)", value="Cursando").strip()
+        if sit_sel.lower() in ("", "(todas)", "todas"):
+            sit_sel = ""
+
+        st.subheader("Buscar aluno")
+        q = st.text_input("Digite nome, ID do aluno ou INEP", value="").strip().upper()
+
+        df_busca = api_search(escola, ano_sel, sit_sel, q, limit=200)
+
     else:
-        escola = st.session_state.get("escola", "").strip()
-        st.write(f"Escola: {escola}")
-        dfm_escola = dfm.loc[dfm["Escola_norm"] == escola.upper()].copy()
+        dfm = load_matriculas()
 
-    if dfm_escola.empty:
-        st.warning("Não há matrículas para esta escola na tabela.")
-        st.stop()
+        if is_admin:
+            escolas = sorted(dfm["Escola"].dropna().astype(str).str.strip().unique().tolist())
+            escola_sel = st.selectbox("Escola", options=escolas)
+            escola = (escola_sel or "").strip()
+            dfm_escola = dfm.loc[dfm["Escola_norm"] == escola.upper()].copy()
+        else:
+            escola = st.session_state.get("escola", "").strip()
+            st.write(f"Escola: {escola}")
+            dfm_escola = dfm.loc[dfm["Escola_norm"] == escola.upper()].copy()
 
-    anos = sorted([str(a) for a in dfm_escola["Ano"].dropna().unique()])
-    ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1)
+        if dfm_escola.empty:
+            st.warning("Não há matrículas para esta escola na tabela.")
+            st.stop()
 
-    df_ano = dfm_escola.loc[dfm_escola["Ano"].astype(str) == str(ano_sel)].copy()
+        anos = sorted([str(a) for a in dfm_escola["Ano"].dropna().unique()])
+        ano_sel = st.selectbox("Ano", options=anos, index=len(anos) - 1)
 
-    if "Situação da Matrícula" in df_ano.columns:
-        situacoes = ["(todas)"] + sorted([str(x) for x in df_ano["Situação da Matrícula"].dropna().unique()])
-        sit_sel = st.selectbox(
-            "Situação da matrícula",
-            options=situacoes,
-            index=1 if "Cursando" in situacoes else 0,
-        )
-        if sit_sel != "(todas)":
-            df_ano = df_ano.loc[df_ano["Situação da Matrícula"].astype(str) == sit_sel]
+        df_ano = dfm_escola.loc[dfm_escola["Ano"].astype(str) == str(ano_sel)].copy()
 
-    st.subheader("Buscar aluno")
-    q = st.text_input("Digite nome, ID do aluno ou INEP", value="").strip().upper()
+        if "Situação da Matrícula" in df_ano.columns:
+            situacoes = ["(todas)"] + sorted([str(x) for x in df_ano["Situação da Matrícula"].dropna().unique()])
+            sit_sel = st.selectbox(
+                "Situação da matrícula",
+                options=situacoes,
+                index=1 if "Cursando" in situacoes else 0,
+            )
+            if sit_sel != "(todas)":
+                df_ano = df_ano.loc[df_ano["Situação da Matrícula"].astype(str) == sit_sel]
 
-    df_busca = df_ano
-    if q:
-        digits = "".join([c for c in q if c.isdigit()])
-        mask_nome = df_ano["Nome_norm"].str.contains(q, na=False)
-        mask_id = df_ano["ID_norm"].eq(digits) if digits else False
-        mask_inep = df_ano["INEP_norm"].eq(digits) if digits else False
-        df_busca = df_ano.loc[mask_nome | mask_id | mask_inep]
+        st.subheader("Buscar aluno")
+        q = st.text_input("Digite nome, ID do aluno ou INEP", value="").strip().upper()
 
-    if df_busca.empty:
+        df_busca = df_ano
+        if q:
+            digits = "".join([c for c in q if c.isdigit()])
+            mask_nome = df_ano["Nome_norm"].str.contains(q, na=False)
+            mask_id = df_ano["ID_norm"].eq(digits) if digits else False
+            mask_inep = df_ano["INEP_norm"].eq(digits) if digits else False
+            df_busca = df_ano.loc[mask_nome | mask_id | mask_inep]
+
+    if df_busca is None or df_busca.empty:
         st.info("Nenhum aluno encontrado com esse filtro.")
         st.stop()
 
@@ -290,7 +398,14 @@ def main():
     idx = st.selectbox("Selecionar aluno", options=list(range(len(options))), format_func=lambda i: options[i])
     sel_id = df_lista.loc[idx, "ID_norm"]
 
-    df_aluno = df_busca.loc[df_busca["ID_norm"] == sel_id].copy()
+    if use_api:
+        df_aluno = api_student(escola, ano_sel, sel_id)
+    else:
+        df_aluno = df_busca.loc[df_busca["ID_norm"] == sel_id].copy()
+
+    if df_aluno is None or df_aluno.empty:
+        st.warning("Não foi possível carregar os dados completos do aluno.")
+        st.stop()
 
     st.subheader("Dados para o atestado")
     st.write(f"Aluno: {safe_first(df_aluno['Nome'])}")
@@ -327,7 +442,4 @@ def main():
 
 
 if __name__ == "__main__":
-    st.write("USUARIOS secret:", "USUARIOS_CSV_GZ_B64" in st.secrets)
-    st.write("MATRICULAS secret:", "MATRICULAS_CSV_GZ_B64" in st.secrets)
-
     main()
